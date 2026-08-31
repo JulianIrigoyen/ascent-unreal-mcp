@@ -1,6 +1,6 @@
 {
   "name": "ascent-unreal-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Project-specific MCP server for orderly Unreal, UDS, map, and material operations in Ascent.",
   "type": "module",
   "bin": {

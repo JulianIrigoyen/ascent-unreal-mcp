@@ -24,10 +24,19 @@ const expected = [
     "uds_apply_preset",
     "uds_inspect_level",
     "unreal_apply_material_to_actor",
+    "unreal_asset_probe",
+    "unreal_create_material_instance",
     "unreal_duplicate_map",
+    "unreal_import_animation",
+    "unreal_import_assets",
+    "unreal_list_assets",
     "unreal_probe_actor",
     "unreal_run_python_script",
+    "unreal_screenshot",
     "unreal_set_actor_properties",
+    "unreal_set_asset_properties",
+    "unreal_snapshot_level",
+    "unreal_spawn_actors",
 ].sort();
 if (JSON.stringify(names) !== JSON.stringify(expected)) {
     fail(`tool list mismatch: ${names.join(", ")}`);
@@ -60,5 +69,22 @@ const escape = JSON.parse(text(await client.callTool({
 })));
 if (escape.ok !== false)
     fail("path escape was not rejected");
+// v2.1 additions: screenshot dry-run shape + spawn source validation.
+const shotDry = JSON.parse(text(await client.callTool({
+    name: "unreal_screenshot",
+    arguments: { map: "/Game/Maps/LaninTrue", dryRun: true },
+})));
+if (!shotDry.ok || shotDry.dryRun !== true || !Array.isArray(shotDry.args))
+    fail("screenshot dry-run shape wrong");
+const badSpawn = JSON.parse(text(await client.callTool({
+    name: "unreal_spawn_actors",
+    arguments: {
+        map: "/Game/Maps/LaninTrue",
+        actors: [{ source: "C:/evil.exe", label: "x", location: { x: 0, y: 0, z: 0 } }],
+        dryRun: true,
+    },
+})));
+if (badSpawn.ok !== false)
+    fail("spawn source validation missing");
 console.log(JSON.stringify({ ok: true, tools: names.length, editorRunning: status.editorRunning }));
 await client.close();

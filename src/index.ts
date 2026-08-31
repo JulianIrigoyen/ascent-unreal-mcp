@@ -29,7 +29,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 // ── config ───────────────────────────────────────────────────────
-export const VERSION = "2.0.0";
+export const VERSION = "2.1.0";
 const root = path.resolve(process.env.ASCENT_ROOT ?? path.join(process.cwd(), "..", ".."));
 const uproject = path.resolve(process.env.ASCENT_UPROJECT ?? path.join(root, "Ascent", "Ascent.uproject"));
 const editorCmd = path.resolve(
@@ -61,7 +61,8 @@ export function resolveScript(rel: string): string {
 }
 
 export function assertGamePath(p: string, label: string): string {
-  if (!p.startsWith("/Game/") || p.includes("..") || p.includes("\\")) {
+  const rooted = p === "/Game" || p.startsWith("/Game/");
+  if (!rooted || p.includes("..") || p.includes("\\")) {
     throw new Error(`${label} must be a clean /Game/... path, got: ${p}`);
   }
   return p;
@@ -778,6 +779,634 @@ server.tool(
       editorRunning: editorUp,
       generatedDir,
       generatedScripts: generatedCount,
+    });
+  },
+);
+
+// ═══ v2.1: world-building suite ══════════════════════════════════
+// Grounded in what this project does every day: place things, import
+// things, tune materials/data assets, and SEE the result.
+
+const editorExe = path.join(path.dirname(editorCmd), "UnrealEditor.exe");
+
+const gamePathSchema = z.string().describe("/Game/... asset path");
+
+server.tool(
+  "unreal_list_assets",
+  "READ-ONLY: query the asset registry under a /Game path, optionally filtering by class-name and " +
+    "asset-name substrings. Cheap discovery before probe/set tools.",
+  {
+    path: gamePathSchema.default("/Game"),
+    classContains: z.string().optional(),
+    nameContains: z.string().optional(),
+    limit: z.number().int().min(1).max(500).default(50),
+    allowWithEditorOpen: z.boolean().default(true),
+    timeoutSeconds: timeoutSchema,
+    dryRun: z.boolean().default(false),
+  },
+  async ({ path: gamePath, classContains, nameContains, limit, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(gamePath, "path");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_list_assets", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+reg = unreal.AssetRegistryHelpers.get_asset_registry()
+f = unreal.ARFilter(package_paths=[${pyString(gamePath)}], recursive_paths=True)
+cls_needle = ${pyValue(classContains ?? null)}
+name_needle = ${pyValue(nameContains ?? null)}
+out = []
+for ad in reg.get_assets(f):
+    cls = str(ad.asset_class_path.asset_name)
+    name = str(ad.asset_name)
+    if cls_needle and cls_needle.lower() not in cls.lower():
+        continue
+    if name_needle and name_needle.lower() not in name.lower():
+        continue
+    out.append({"name": name, "class": cls, "path": str(ad.package_name)})
+    if len(out) >= ${pyValue(limit)}:
+        break
+unreal.log("MCP ASSETS_JSON " + json.dumps(out))
+unreal.log("MCP OK unreal_list_assets")
+`;
+    return execGenerated("unreal_list_assets", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+const PY_ASSET_TARGET = `
+def _asset_target(asset_path, class_defaults):
+    a = unreal.load_asset(asset_path)
+    if not a:
+        raise RuntimeError("asset not found: %s" % asset_path)
+    if class_defaults:
+        gc = a.generated_class() if isinstance(a, unreal.Blueprint) else None
+        if gc:
+            return unreal.get_default_object(gc), "CDO of %s" % asset_path
+        raise RuntimeError("classDefaults requested but %s is not a Blueprint" % asset_path)
+    return a, asset_path
+`;
+
+server.tool(
+  "unreal_asset_probe",
+  "READ-ONLY: read properties by display name off ANY asset — DataAssets (e.g. TOD profiles), " +
+    "meshes, materials — or a Blueprint's class defaults (classDefaults: true). The asset-side " +
+    "sibling of unreal_probe_actor.",
+  {
+    asset: gamePathSchema,
+    props: z.array(z.string().min(1)).min(1).max(40),
+    classDefaults: z.boolean().default(false),
+    allowWithEditorOpen: z.boolean().default(true),
+    timeoutSeconds: timeoutSchema,
+    dryRun: z.boolean().default(false),
+  },
+  async ({ asset, props, classDefaults, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(asset, "asset");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_asset_probe", error: String(e) });
+    }
+    const body = `${PY_HEADER}${PY_ASSET_TARGET}
+target, label = _asset_target(${pyString(asset)}, ${pyValue(classDefaults)})
+out = {"target": label, "class": target.get_class().get_name(), "props": {}}
+for p in ${pyValue(props)}:
+    try:
+        out["props"][p] = _obj(target.get_editor_property(p))
+    except Exception as e:
+        out["props"][p] = "<unreadable: %s>" % str(e)[:60]
+unreal.log("MCP ASSET_JSON " + json.dumps(out, default=str))
+unreal.log("MCP OK unreal_asset_probe")
+`;
+    return execGenerated("unreal_asset_probe", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_set_asset_properties",
+  "Set simple-valued properties (number/bool/string; a /Game/... string is auto-loaded as an " +
+    "object reference) on an asset or a Blueprint's class defaults, then save the asset. " +
+    "Struct/array properties are NOT supported — use unreal_run_python_script for those.",
+  {
+    asset: gamePathSchema,
+    properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])),
+    classDefaults: z.boolean().default(false),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+  },
+  async ({ asset, properties, classDefaults, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(asset, "asset");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_set_asset_properties", error: String(e) });
+    }
+    const body = `${PY_HEADER}${PY_ASSET_TARGET}
+target, label = _asset_target(${pyString(asset)}, ${pyValue(classDefaults)})
+values = ${pyValue(properties)}
+applied = 0
+failed = 0
+for p, v in values.items():
+    resolved = v
+    if isinstance(v, str) and v.startswith("/Game/"):
+        loaded = unreal.load_asset(v)
+        if loaded:
+            resolved = loaded
+    try:
+        before = _obj(target.get_editor_property(p))
+        target.set_editor_property(p, resolved)
+        applied += 1
+        unreal.log("MCP SET %s.%s: %s -> %s" % (label, p, before, v))
+    except Exception as e:
+        failed += 1
+        unreal.log_warning("MCP SET_FAIL %s.%s: %s" % (label, p, str(e)[:80]))
+if applied == 0:
+    raise RuntimeError("ZERO properties applied (%d failed) — check display names" % failed)
+ok = unreal.EditorAssetLibrary.save_asset(${pyString(asset)}, only_if_is_dirty=False)
+if not ok:
+    raise RuntimeError("save_asset FAILED for %s" % ${pyString(asset)})
+unreal.log("MCP SET_SUMMARY applied=%d failed=%d saved=True" % (applied, failed))
+unreal.log("MCP OK unreal_set_asset_properties")
+`;
+    return execGenerated("unreal_set_asset_properties", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_spawn_actors",
+  "Batch-spawn actors into a map and save. Each entry: source (a /Game static mesh or Blueprint " +
+    "asset, or a /Script/Module.Class), label, location, optional rotation/scale/tags. " +
+    "clearTag first deletes every actor carrying that tag (idempotent re-runs). " +
+    "NOTE: headless commandlets have no physics scene — no ground traces; supply explicit Z.",
+  {
+    map: gamePathSchema,
+    actors: z
+      .array(
+        z.object({
+          source: z.string().min(1),
+          label: z.string().min(1),
+          location: z.object({ x: z.number(), y: z.number(), z: z.number() }),
+          rotation: z.object({ pitch: z.number(), yaw: z.number(), roll: z.number() }).optional(),
+          scale: z.number().positive().optional(),
+          tags: z.array(z.string()).max(8).default([]),
+        }),
+      )
+      .min(1)
+      .max(500),
+    clearTag: z.string().optional(),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+  },
+  async ({ map, actors, clearTag, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(map, "map");
+      for (const a of actors) {
+        if (!a.source.startsWith("/Game/") && !a.source.startsWith("/Script/")) {
+          throw new Error(`source must be /Game/... or /Script/...: ${a.source}`);
+        }
+      }
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_spawn_actors", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+world = _load(${pyString(map)})
+sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+clear_tag = ${pyValue(clearTag ?? null)}
+if clear_tag:
+    removed = 0
+    for a in list(sub.get_all_level_actors()):
+        if clear_tag in [str(t) for t in a.tags]:
+            sub.destroy_actor(a)
+            removed += 1
+    unreal.log("MCP SPAWN cleared %d actors tagged %s" % (removed, clear_tag))
+
+def _spawn_source(src):
+    if src.startswith("/Script/"):
+        cls = unreal.load_class(None, src)
+        if not cls:
+            raise RuntimeError("class not found: %s" % src)
+        return ("class", cls)
+    a = unreal.load_asset(src)
+    if not a:
+        raise RuntimeError("asset not found: %s" % src)
+    if isinstance(a, unreal.Blueprint):
+        return ("class", a.generated_class())
+    return ("object", a)
+
+spawned = 0
+for item in ${pyValue(actors)}:
+    kind, src = _spawn_source(item["source"])
+    loc = unreal.Vector(item["location"]["x"], item["location"]["y"], item["location"]["z"])
+    rot = unreal.Rotator()
+    r = item.get("rotation")
+    if r:
+        rot.pitch = r["pitch"]; rot.yaw = r["yaw"]; rot.roll = r["roll"]
+    actor = (sub.spawn_actor_from_class(src, loc, rot) if kind == "class"
+             else sub.spawn_actor_from_object(src, loc, rot))
+    if not actor:
+        raise RuntimeError("spawn failed for %s" % item["source"])
+    actor.set_actor_label(item["label"])
+    if item.get("tags"):
+        actor.tags = item["tags"]
+    s = item.get("scale")
+    if s:
+        actor.set_actor_scale3d(unreal.Vector(s, s, s))
+    spawned += 1
+unreal.log("MCP SPAWN placed %d actors" % spawned)
+_save(world, ${pyString(map)})
+unreal.log("MCP OK unreal_spawn_actors")
+`;
+    return execGenerated("unreal_spawn_actors", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_import_assets",
+  "Batch-import files (FBX meshes, PNG/JPG textures, WAV) into /Game destinations via " +
+    "AssetImportTask. textureType configures compression: 'normal' (TC_Normalmap, sRGB off), " +
+    "'mask' (sRGB off), 'color' (default). Files must live inside the repo. " +
+    "Big texture batches can exhaust headless memory — chunk them.",
+  {
+    files: z
+      .array(
+        z.object({
+          file: z.string().min(1).describe("Repo-relative or absolute path inside the repo"),
+          destination: gamePathSchema,
+          name: z.string().optional(),
+          textureType: z.enum(["color", "normal", "mask"]).optional(),
+        }),
+      )
+      .min(1)
+      .max(40),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+  },
+  async ({ files, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    let resolved: Array<{ file: string; destination: string; name?: string; textureType?: string }>;
+    try {
+      resolved = files.map((f) => ({
+        ...f,
+        file: resolveInsideRoot(path.isAbsolute(f.file) ? path.relative(root, f.file) : f.file),
+        destination: assertGamePath(f.destination, "destination"),
+      }));
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_import_assets", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+at = unreal.AssetToolsHelpers.get_asset_tools()
+eal = unreal.EditorAssetLibrary
+imported = 0
+for item in ${pyValue(resolved)}:
+    t = unreal.AssetImportTask()
+    t.filename = item["file"]
+    t.destination_path = item["destination"]
+    if item.get("name"):
+        t.destination_name = item["name"]
+    t.replace_existing = True
+    t.automated = True
+    t.save = True
+    at.import_asset_tasks([t])
+    paths = list(t.imported_object_paths or [])
+    if not paths:
+        raise RuntimeError("import produced nothing for %s" % item["file"])
+    for p in paths:
+        obj = unreal.load_asset(p)
+        tt = item.get("textureType")
+        if tt and isinstance(obj, unreal.Texture2D):
+            if tt == "normal":
+                obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+                obj.set_editor_property("srgb", False)
+            elif tt == "mask":
+                obj.set_editor_property("srgb", False)
+            if not eal.save_asset(p, only_if_is_dirty=False):
+                raise RuntimeError("save_asset FAILED after texture config for %s" % p)
+        unreal.log("MCP IMPORTED %s" % p)
+        imported += 1
+unreal.log("MCP IMPORT_SUMMARY count=%d" % imported)
+unreal.log("MCP OK unreal_import_assets")
+`;
+    return execGenerated("unreal_import_assets", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_create_material_instance",
+  "Create (or update) a MaterialInstanceConstant from a parent material and set scalar/vector/" +
+    "texture parameters, then save.",
+  {
+    parent: gamePathSchema,
+    destination: gamePathSchema.describe("/Game folder to create in"),
+    name: z.string().min(1),
+    scalars: z.record(z.string(), z.number()).default({}),
+    vectors: z.record(z.string(), z.array(z.number()).length(4)).default({}),
+    textures: z.record(z.string(), z.string()).default({}),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+  },
+  async ({ parent, destination, name, scalars, vectors, textures, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(parent, "parent");
+      assertGamePath(destination, "destination");
+      for (const t of Object.values(textures)) assertGamePath(t, "texture");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_create_material_instance", error: String(e) });
+    }
+    const miPath = `${destination}/${name}`;
+    const body = `${PY_HEADER}
+eal = unreal.EditorAssetLibrary
+mel = unreal.MaterialEditingLibrary
+parent = unreal.load_asset(${pyString(parent)})
+if not parent:
+    raise RuntimeError("parent material missing: %s" % ${pyString(parent)})
+mi_path = ${pyString(miPath)}
+mi = unreal.load_asset(mi_path)
+if not mi:
+    at = unreal.AssetToolsHelpers.get_asset_tools()
+    mi = at.create_asset(${pyString(name)}, ${pyString(destination)}, unreal.MaterialInstanceConstant,
+                         unreal.MaterialInstanceConstantFactoryNew())
+    if not mi:
+        raise RuntimeError("create_asset failed for %s" % mi_path)
+    unreal.log("MCP MI created %s" % mi_path)
+mel.set_material_instance_parent(mi, parent)
+# UE 5.7's MEL setters return False even on success — verify by READBACK,
+# never by return value (engine-source-verified by the review panel).
+applied = 0
+for k, v in ${pyValue(scalars)}.items():
+    mel.set_material_instance_scalar_parameter_value(mi, k, v)
+    got = mel.get_material_instance_scalar_parameter_value(mi, k)
+    if abs(got - v) < 1e-4:
+        applied += 1
+    else:
+        unreal.log_warning("MCP MI_PARAM_FAIL scalar %s (readback %s != %s)" % (k, got, v))
+for k, v in ${pyValue(vectors)}.items():
+    want = unreal.LinearColor(v[0], v[1], v[2], v[3])
+    mel.set_material_instance_vector_parameter_value(mi, k, want)
+    got = mel.get_material_instance_vector_parameter_value(mi, k)
+    if got and all(abs(a - b) < 1e-4 for a, b in ((got.r, want.r), (got.g, want.g), (got.b, want.b), (got.a, want.a))):
+        applied += 1
+    else:
+        unreal.log_warning("MCP MI_PARAM_FAIL vector %s" % k)
+for k, v in ${pyValue(textures)}.items():
+    tex = unreal.load_asset(v)
+    if not tex:
+        unreal.log_warning("MCP MI_PARAM_FAIL texture %s: asset missing %s" % (k, v))
+        continue
+    mel.set_material_instance_texture_parameter_value(mi, k, tex)
+    got = mel.get_material_instance_texture_parameter_value(mi, k)
+    if got == tex:
+        applied += 1
+    else:
+        unreal.log_warning("MCP MI_PARAM_FAIL texture %s -> %s" % (k, v))
+if not eal.save_asset(mi_path, only_if_is_dirty=False):
+    raise RuntimeError("save_asset FAILED for %s" % mi_path)
+unreal.log("MCP MI_SUMMARY path=%s params_applied=%d" % (mi_path, applied))
+unreal.log("MCP OK unreal_create_material_instance")
+`;
+    return execGenerated("unreal_create_material_instance", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_import_animation",
+  "Import an animation-only FBX onto an EXISTING skeleton (the Trekker pipeline: no mesh, " +
+    "exported-time length, no default sample rate). Post-tune the sequence with " +
+    "unreal_set_asset_properties if needed.",
+  {
+    file: z.string().min(1),
+    destination: gamePathSchema,
+    skeleton: gamePathSchema.describe("Skeleton asset path, e.g. the Trekker *_Skeleton"),
+    name: z.string().optional(),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+  },
+  async ({ file, destination, skeleton, name, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    let filePath: string;
+    try {
+      filePath = resolveInsideRoot(path.isAbsolute(file) ? path.relative(root, file) : file);
+      assertGamePath(destination, "destination");
+      assertGamePath(skeleton, "skeleton");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_import_animation", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+skel = unreal.load_asset(${pyString(skeleton)})
+if not skel:
+    raise RuntimeError("skeleton missing: %s" % ${pyString(skeleton)})
+ui = unreal.FbxImportUI()
+ui.set_editor_property("import_mesh", False)
+ui.set_editor_property("import_animations", True)
+ui.set_editor_property("import_as_skeletal", False)
+ui.set_editor_property("skeleton", skel)
+ui.set_editor_property("automated_import_should_detect_type", False)
+ui.set_editor_property("mesh_type_to_import", unreal.FBXImportType.FBXIT_ANIMATION)
+anim = ui.get_editor_property("anim_sequence_import_data")
+anim.set_editor_property("animation_length", unreal.FBXAnimationLengthImportType.FBXALIT_EXPORTED_TIME)
+anim.set_editor_property("use_default_sample_rate", False)
+t = unreal.AssetImportTask()
+t.filename = ${pyString(filePath)}
+t.destination_path = ${pyString(destination)}
+${name ? `t.destination_name = ${pyString(name)}` : ""}
+t.replace_existing = True
+t.automated = True
+t.save = True
+t.options = ui
+unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([t])
+paths = list(t.imported_object_paths or [])
+if not paths:
+    raise RuntimeError("animation import produced nothing for %s" % ${pyString(filePath)})
+for p in paths:
+    unreal.log("MCP ANIM_IMPORTED %s" % p)
+unreal.log("MCP OK unreal_import_animation")
+`;
+    return execGenerated("unreal_import_animation", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+server.tool(
+  "unreal_snapshot_level",
+  "Regenerate the level snapshot markdown (label, class, transform, tags for every actor) that " +
+    "CLAUDE.md declares the authoritative source of level truth. Writes inside the repo.",
+  {
+    map: gamePathSchema,
+    outFile: z.string().default(".claude/level-snapshot.md"),
+    allowWithEditorOpen: z.boolean().default(true),
+    timeoutSeconds: timeoutSchema,
+    dryRun: z.boolean().default(false),
+  },
+  async ({ map, outFile, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    let outPath: string;
+    try {
+      assertGamePath(map, "map");
+      outPath = resolveInsideRoot(outFile);
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_snapshot_level", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+import datetime
+world = _load(${pyString(map)})
+sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+lines = ["# Level snapshot: %s" % ${pyString(map)},
+         "", "Generated %s by ascent-unreal-mcp unreal_snapshot_level." % datetime.datetime.now().isoformat(timespec="seconds"),
+         "", "| Label | Class | Location | Rotation | Scale | Tags |", "|---|---|---|---|---|---|"]
+count = 0
+for a in sub.get_all_level_actors():
+    loc = a.get_actor_location(); rot = a.get_actor_rotation(); s = a.get_actor_scale3d()
+    lines.append("| %s | %s | (%.0f, %.0f, %.0f) | (%.1f, %.1f, %.1f) | (%.2f, %.2f, %.2f) | %s |" % (
+        a.get_actor_label(), a.get_class().get_name(),
+        loc.x, loc.y, loc.z, rot.pitch, rot.yaw, rot.roll, s.x, s.y, s.z,
+        " ".join(str(t) for t in a.tags) or "-"))
+    count += 1
+with open(${pyString(outPath)}, "w", encoding="utf-8") as fh:
+    fh.write("\\n".join(lines) + "\\n")
+unreal.log("MCP SNAPSHOT %d actors -> %s" % (count, ${pyString(outPath)}))
+unreal.log("MCP OK unreal_snapshot_level")
+`;
+    return execGenerated("unreal_snapshot_level", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+  },
+);
+
+// ── the eyes: rendered screenshots ───────────────────────────────
+const CAPTURE_PS1 = String.raw`param([string]$OutFile, [string]$ConsoleCmds = "", [int]$GamePid = 0)
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type 'using System;using System.Runtime.InteropServices;public class WMcp {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+}'
+# Target STRICTLY by PID: with an editor open, process name + window title
+# cannot distinguish the -game instance from the editor.
+if ($GamePid -le 0) { Write-Output "MCPSHOT NOPID"; exit 1 }
+$p = Get-Process -Id $GamePid -ErrorAction SilentlyContinue
+if (-not $p) { Write-Output "MCPSHOT NOWINDOW"; exit 1 }
+$p.Refresh()
+if ($p.MainWindowHandle -eq [IntPtr]::Zero) { Write-Output "MCPSHOT NOWINDOW"; exit 1 }
+[WMcp]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+Start-Sleep -Milliseconds 600
+# NEVER send keys unless the game truly holds focus — otherwise console
+# commands get typed into whatever app the user is using.
+[uint]$fgpid = 0
+[WMcp]::GetWindowThreadProcessId([WMcp]::GetForegroundWindow(), [ref]$fgpid) | Out-Null
+if ($fgpid -ne [uint]$p.Id) { Write-Output "MCPSHOT NOFOCUS fg=$fgpid want=$($p.Id)"; exit 1 }
+if ($ConsoleCmds -ne "") {
+  $tick = [string][char]0x60
+  foreach ($cmd in $ConsoleCmds -split ";;") {
+    [System.Windows.Forms.SendKeys]::SendWait($tick)
+    Start-Sleep -Milliseconds 350
+    $esc = $cmd -replace '([+^%~(){}\[\]])','{$1}'
+    [System.Windows.Forms.SendKeys]::SendWait($esc)
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 900
+  }
+}
+Start-Sleep -Milliseconds 800
+$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+$bmp.Save($OutFile, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose(); $bmp.Dispose()
+Write-Output "MCPSHOT SAVED $OutFile"`;
+
+server.tool(
+  "unreal_screenshot",
+  "THE EYES: launch a -game instance of a map, wait for it to settle, teleport through vantages " +
+    "(BugItGo) and/or run console commands, screen-capture each, kill the game, return PNG paths. " +
+    "This is the pattern every visual verification this project ever did was built on. " +
+    "Windows-only; steals foreground focus while capturing. Serialized with all other runs.",
+  {
+    map: gamePathSchema,
+    vantages: z
+      .array(
+        z.object({
+          name: z.string().regex(/^[A-Za-z0-9_-]{1,40}$/, "vantage name: letters/digits/_/- only"),
+          bugItGo: z
+            .object({ x: z.number(), y: z.number(), z: z.number(), pitch: z.number().default(0), yaw: z.number().default(0) })
+            .optional(),
+          console: z.array(z.string().max(120)).max(6).default([]),
+        }),
+      )
+      .min(1)
+      .max(8)
+      .default([{ name: "default", console: [] }]),
+    settleSeconds: z.number().int().min(5).max(180).default(25),
+    resX: z.number().int().min(640).max(3840).default(1600),
+    resY: z.number().int().min(480).max(2160).default(900),
+    timeoutSeconds: z.number().int().min(60).max(900).default(300),
+    dryRun: dryRunSchema,
+  },
+  async ({ map, vantages, settleSeconds, resX, resY, timeoutSeconds, dryRun }) => {
+    try {
+      assertGamePath(map, "map");
+    } catch (e) {
+      return jsonResult(false, { tool: "unreal_screenshot", error: String(e) });
+    }
+    const gameArgs = [uproject, map, "-game", "-windowed", `-ResX=${resX}`, `-ResY=${resY}`, "-log", "LOG=mcp_screenshot.log"];
+    if (dryRun) {
+      return jsonResult(true, { tool: "unreal_screenshot", dryRun: true, command: editorExe, args: gameArgs, vantages: vantages.map((v) => v.name) });
+    }
+    if (!existsSync(editorExe)) return jsonResult(false, { tool: "unreal_screenshot", error: `editor exe not found: ${editorExe}` });
+
+    const shotsDir = path.join(generatedDir, "shots");
+    mkdirSync(shotsDir, { recursive: true });
+    const ps1 = path.join(generatedDir, "mcp_capture.ps1");
+    await fsp.writeFile(ps1, CAPTURE_PS1, "utf8");
+
+    return withLock(async () => {
+      const editorUp = await editorRunning();
+      const game = spawn(editorExe, gameArgs, { cwd: root, windowsHide: false, detached: false });
+      let spawnError: string | undefined;
+      game.on("error", (e) => {
+        // An unlistened ChildProcess 'error' is an uncaught exception that
+        // would take the whole MCP server down.
+        spawnError = String(e);
+      });
+      const gamePid = game.pid;
+      const killGame = () => gamePid && killTree(gamePid);
+      const deadline = Date.now() + timeoutSeconds * 1000;
+      const hardTimer = setTimeout(killGame, timeoutSeconds * 1000);
+      const shots: Array<{ name: string; file: string; ok: boolean; detail?: string }> = [];
+      let timedOut = false;
+      try {
+        const settleMs = Math.min(settleSeconds * 1000, Math.max(0, deadline - Date.now() - 15_000));
+        await new Promise((r) => setTimeout(r, settleMs));
+        if (spawnError || !gamePid) {
+          return jsonResult(false, { tool: "unreal_screenshot", error: `game failed to launch: ${spawnError ?? "no pid"}` });
+        }
+        for (const v of vantages) {
+          if (Date.now() > deadline - 5_000) {
+            timedOut = true;
+            break;
+          }
+          const cmds: string[] = [];
+          if (v.bugItGo) cmds.push(`BugItGo ${v.bugItGo.x} ${v.bugItGo.y} ${v.bugItGo.z} ${v.bugItGo.pitch} ${v.bugItGo.yaw} 0`);
+          cmds.push(...v.console);
+          const file = path.join(shotsDir, `${v.name}-${Date.now()}.png`);
+          const cap = await runProcess(
+            "powershell",
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-OutFile", file, "-ConsoleCmds", cmds.join(";;"), "-GamePid", String(gamePid)],
+            60_000,
+          );
+          const detail = cap.stdout.match(/MCPSHOT \w+[^\r\n]*/)?.[0];
+          shots.push({ name: v.name, file, ok: cap.stdout.includes("MCPSHOT SAVED") && existsSync(file), detail });
+        }
+      } finally {
+        clearTimeout(hardTimer);
+        killGame();
+      }
+      const ok = !timedOut && shots.length > 0 && shots.every((s) => s.ok);
+      return jsonResult(ok, {
+        tool: "unreal_screenshot",
+        map,
+        timedOut,
+        editorRunning: editorUp,
+        shots,
+        note: ok
+          ? undefined
+          : "capture(s) failed or timed out — NOFOCUS means the game never held foreground (user active elsewhere?)",
+      });
     });
   },
 );
