@@ -1,0 +1,44 @@
+{
+  "name": "ascent-unreal-mcp",
+  "version": "0.1.0",
+  "description": "Project-specific MCP server for orderly Unreal, UDS, map, and material operations in Ascent.",
+  "type": "module",
+  "bin": {
+    "ascent-unreal-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && npm run smoke",
+    "smoke": "node dist/smoke.js",
+    "prepack": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "keywords": [
+    "mcp",
+    "unreal",
+    "ultra-dynamic-sky",
+    "ascent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
