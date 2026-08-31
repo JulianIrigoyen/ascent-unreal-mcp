@@ -68,3 +68,14 @@ test("assertGamePath: /Game only, no traversal, no backslashes", () => {
 test("pyString is JSON.stringify (valid python string literal)", () => {
     assert.equal(pyString("hi 'there' \"quoted\""), JSON.stringify("hi 'there' \"quoted\""));
 });
+test("evaluateExpectation: equals/contains/min-max semantics", async () => {
+    const { evaluateExpectation } = await import("./index.js");
+    assert.equal(evaluateExpectation({ prop: "x", equals: true }, true).pass, true);
+    assert.equal(evaluateExpectation({ prop: "x", equals: "True" }, true).pass, true); // python-side stringing
+    assert.equal(evaluateExpectation({ prop: "x", equals: 358 }, 358.00001).pass, true);
+    assert.equal(evaluateExpectation({ prop: "x", equals: 358 }, 60).pass, false);
+    assert.equal(evaluateExpectation({ prop: "x", contains: "weather" }, "Ultra_Dynamic_Weather_C_0").pass, true);
+    assert.equal(evaluateExpectation({ prop: "x", min: 1, max: 10 }, 5).pass, true);
+    assert.equal(evaluateExpectation({ prop: "x", min: 1 }, "not a number").pass, false);
+    assert.equal(evaluateExpectation({ prop: "x" }, 5).pass, false); // no operator = fail loudly
+});

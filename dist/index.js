@@ -1140,6 +1140,121 @@ unreal.log("MCP OK unreal_snapshot_level")
 `;
     return execGenerated("unreal_snapshot_level", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
 });
+export function evaluateExpectation(exp, value) {
+    const num = typeof value === "number" ? value : Number.parseFloat(String(value));
+    if (exp.equals !== undefined) {
+        const pass = typeof exp.equals === "number" && Number.isFinite(num)
+            ? Math.abs(num - exp.equals) < 1e-4
+            : String(value).toLowerCase() === String(exp.equals).toLowerCase();
+        return { pass, detail: `${exp.prop}: got ${JSON.stringify(value)}, expected == ${JSON.stringify(exp.equals)}` };
+    }
+    if (exp.contains !== undefined) {
+        const pass = String(value).toLowerCase().includes(exp.contains.toLowerCase());
+        return { pass, detail: `${exp.prop}: got ${JSON.stringify(value)}, expected to contain ${JSON.stringify(exp.contains)}` };
+    }
+    if (exp.min !== undefined || exp.max !== undefined) {
+        const pass = Number.isFinite(num) && (exp.min === undefined || num >= exp.min) && (exp.max === undefined || num <= exp.max);
+        return { pass, detail: `${exp.prop}: got ${JSON.stringify(value)}, expected in [${exp.min ?? "-inf"}, ${exp.max ?? "inf"}]` };
+    }
+    return { pass: false, detail: `${exp.prop}: expectation has no operator (equals/contains/min/max)` };
+}
+server.tool("ascent_apply_then_verify", "Run a repo script, then — in the SAME commandlet boot — probe an actor or asset and check " +
+    "expectations against the read-back values. The whole call fails unless the script succeeds AND " +
+    "every expectation passes. 'Probe before you believe', as infrastructure: a mutation that can't " +
+    "prove itself didn't happen.", {
+    script: z.string().describe("Repo-relative scripts/*.py to apply"),
+    args: z.array(z.string()).max(8).default([]),
+    verify: z.object({
+        map: z.string().optional(),
+        actorMatch: z.string().optional(),
+        asset: z.string().optional(),
+        classDefaults: z.boolean().default(false),
+        props: z.array(z.string().min(1)).min(1).max(40),
+    }),
+    expect: z
+        .array(z.object({
+        prop: z.string().min(1),
+        equals: z.union([z.string(), z.number(), z.boolean()]).optional(),
+        contains: z.string().optional(),
+        min: z.number().optional(),
+        max: z.number().optional(),
+    }))
+        .min(1)
+        .max(40),
+    allowWithEditorOpen: z.boolean().default(false),
+    timeoutSeconds: timeoutSchema,
+    dryRun: dryRunSchema,
+}, async ({ script, args, verify, expect, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    let scriptPath;
+    try {
+        scriptPath = resolveScript(script);
+        if (verify.asset)
+            assertGamePath(verify.asset, "verify.asset");
+        if (verify.map)
+            assertGamePath(verify.map, "verify.map");
+        if (!verify.asset && !(verify.map && verify.actorMatch)) {
+            throw new Error("verify needs either {asset} or {map, actorMatch}");
+        }
+    }
+    catch (e) {
+        return jsonResult(false, { tool: "ascent_apply_then_verify", error: String(e) });
+    }
+    const probePy = verify.asset
+        ? `target, label = _asset_target(${pyString(verify.asset)}, ${pyValue(verify.classDefaults)})`
+        : `world = _load(${pyString(verify.map)})
+sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+needle = ${pyString(verify.actorMatch)}.lower()
+target = None
+for a in sub.get_all_level_actors():
+    if needle in a.get_actor_label().lower() or needle in a.get_class().get_name().lower():
+        target = a
+        break
+if not target:
+    raise RuntimeError("verify: no actor matched %r" % ${pyString(verify.actorMatch)})
+label = target.get_actor_label()`;
+    const body = `${PY_HEADER}${PY_ASSET_TARGET}
+import sys
+_t = ${pyString(scriptPath)}
+sys.argv = [_t] + ${pyValue(args)}
+_code = compile(open(_t, encoding="utf-8").read(), _t, "exec")
+exec(_code, {"__name__": "__main__", "__file__": _t})
+unreal.log("MCP APPLIED %s" % _t)
+${probePy}
+out = {"target": str(label), "props": {}}
+for p in ${pyValue(verify.props)}:
+    try:
+        out["props"][p] = _obj(target.get_editor_property(p))
+    except Exception as e:
+        out["props"][p] = "<unreadable: %s>" % str(e)[:60]
+unreal.log("MCP VERIFY_JSON " + json.dumps(out, default=str))
+unreal.log("MCP OK ascent_apply_then_verify")
+`;
+    const raw = await execGenerated("ascent_apply_then_verify", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
+    if (dryRun)
+        return raw;
+    const parsed = JSON.parse(raw.content[0].text);
+    const verifyLine = (parsed.output ?? []).find((l) => l.includes("MCP VERIFY_JSON "));
+    let checks = [];
+    if (verifyLine) {
+        try {
+            const data = JSON.parse(verifyLine.slice(verifyLine.indexOf("MCP VERIFY_JSON ") + "MCP VERIFY_JSON ".length));
+            checks = expect.map((e) => evaluateExpectation(e, data.props[e.prop]));
+        }
+        catch (e) {
+            checks = [{ pass: false, detail: `could not parse VERIFY_JSON: ${e}` }];
+        }
+    }
+    else {
+        checks = [{ pass: false, detail: "no VERIFY_JSON line in output" }];
+    }
+    const allPass = checks.every((c) => c.pass);
+    return jsonResult(parsed.ok && allPass, {
+        ...parsed,
+        tool: "ascent_apply_then_verify",
+        ok: undefined,
+        verification: { allPass, checks },
+    });
+});
 // ── the eyes: rendered screenshots ───────────────────────────────
 const CAPTURE_PS1 = String.raw `param([string]$OutFile, [string]$ConsoleCmds = "", [int]$GamePid = 0)
 Add-Type -AssemblyName System.Drawing
@@ -1272,6 +1387,255 @@ server.tool("unreal_screenshot", "THE EYES: launch a -game instance of a map, wa
                 : "capture(s) failed or timed out — NOFOCUS means the game never held foreground (user active elsewhere?)",
         });
     });
+});
+// ── weather/sky director: per-phase stills ───────────────────────
+server.tool("weather_capture_phase_stills", "One-call arc verification: set a TOD profile's driver to a fast FixedTimer, launch the map in " +
+    "-game, detect the run start from the log, capture a screenshot as each PHASE becomes active " +
+    "(named by phase), kill the game, and restore the original driver. Needs the machine idle-ish: " +
+    "captures are focus-verified and report NOFOCUS if you're typing elsewhere.", {
+    map: gamePathSchema,
+    profile: gamePathSchema.describe("The UAscensoTimeOfDayProfile asset driving this map"),
+    fixedTimerSeconds: z.number().int().min(60).max(600).default(180),
+    resX: z.number().int().min(640).max(3840).default(1600),
+    resY: z.number().int().min(480).max(2160).default(900),
+    timeoutSeconds: z.number().int().min(120).max(900).default(600),
+    dryRun: dryRunSchema,
+}, async ({ map, profile, fixedTimerSeconds, resX, resY, timeoutSeconds, dryRun }) => {
+    try {
+        assertGamePath(map, "map");
+        assertGamePath(profile, "profile");
+    }
+    catch (e) {
+        return jsonResult(false, { tool: "weather_capture_phase_stills", error: String(e) });
+    }
+    if (dryRun) {
+        return jsonResult(true, {
+            tool: "weather_capture_phase_stills",
+            dryRun: true,
+            plan: [
+                `1. commandlet: read ${profile} phases, save original driver, set FixedTimer ${fixedTimerSeconds}s`,
+                `2. launch ${map} -game, watch log for run start, capture each phase +2s`,
+                `3. kill game, commandlet: restore original driver`,
+            ],
+        });
+    }
+    // Phase A: read phases + flip driver (records the original for restore).
+    const flipBody = `${PY_HEADER}
+tod = unreal.load_asset(${pyString(profile)})
+if not tod:
+    raise RuntimeError("profile missing: %s" % ${pyString(profile)})
+orig_driver = str(tod.get_editor_property("driver"))
+orig_secs = float(tod.get_editor_property("fixed_timer_seconds"))
+phases = [{"name": str(p.get_editor_property("name")), "start": float(p.get_editor_property("start_at01"))}
+          for p in tod.get_editor_property("phases")]
+if not phases:
+    raise RuntimeError("profile has no phases")
+tod.set_editor_property("driver", unreal.AscensoTODDriver.FIXED_TIMER)
+tod.set_editor_property("fixed_timer_seconds", float(${pyValue(fixedTimerSeconds)}))
+if not unreal.EditorAssetLibrary.save_asset(${pyString(profile)}, only_if_is_dirty=False):
+    raise RuntimeError("save_asset failed for profile")
+unreal.log("MCP PHASES_JSON " + json.dumps({"orig_driver": orig_driver, "orig_secs": orig_secs, "phases": phases}))
+unreal.log("MCP OK weather_flip")
+`;
+    const flip = await execGenerated("weather_flip", flipBody, {
+        timeoutSeconds: 300,
+        dryRun: false,
+        allowWithEditorOpen: false,
+        expectMarker: "MCP OK weather_flip",
+    });
+    const flipParsed = JSON.parse(flip.content[0].text);
+    if (!flipParsed.ok)
+        return jsonResult(false, { tool: "weather_capture_phase_stills", stage: "flip-driver", inner: flipParsed });
+    const phasesLine = (flipParsed.output ?? []).find((l) => l.includes("MCP PHASES_JSON "));
+    const meta = JSON.parse(phasesLine.slice(phasesLine.indexOf("MCP PHASES_JSON ") + "MCP PHASES_JSON ".length));
+    const restoreDriver = async () => {
+        const isFixed = meta.orig_driver.includes("FIXED_TIMER");
+        const restoreBody = `${PY_HEADER}
+tod = unreal.load_asset(${pyString(profile)})
+tod.set_editor_property("driver", unreal.AscensoTODDriver.FIXED_TIMER if ${pyValue(isFixed)} else unreal.AscensoTODDriver.SONG_PROGRESS)
+tod.set_editor_property("fixed_timer_seconds", float(${pyValue(meta.orig_secs)}))
+if not unreal.EditorAssetLibrary.save_asset(${pyString(profile)}, only_if_is_dirty=False):
+    raise RuntimeError("restore save failed")
+unreal.log("MCP OK weather_restore")
+`;
+        return execGenerated("weather_restore", restoreBody, {
+            timeoutSeconds: 300,
+            dryRun: false,
+            allowWithEditorOpen: false,
+            expectMarker: "MCP OK weather_restore",
+        });
+    };
+    // Phase B: game + per-phase captures, anchored on the log's first phase transition.
+    const shotsDir = path.join(generatedDir, "shots");
+    mkdirSync(shotsDir, { recursive: true });
+    const ps1 = path.join(generatedDir, "mcp_capture.ps1");
+    await fsp.writeFile(ps1, CAPTURE_PS1, "utf8");
+    const logName = "mcp_phase_stills.log";
+    const logPath = path.join(root, "Ascent", "Saved", "Logs", logName);
+    const gameArgs = [uproject, map, "-game", "-windowed", `-ResX=${resX}`, `-ResY=${resY}`, "-log", `LOG=${logName}`];
+    const result = await withLock(async () => {
+        try {
+            await fsp.unlink(logPath);
+        }
+        catch {
+            /* no stale log */
+        }
+        const game = spawn(editorExe, gameArgs, { cwd: root, windowsHide: false });
+        let spawnError;
+        game.on("error", (e) => (spawnError = String(e)));
+        const gamePid = game.pid;
+        const killGame = () => gamePid && killTree(gamePid);
+        const deadline = Date.now() + timeoutSeconds * 1000;
+        const shots = [];
+        try {
+            // Anchor: the controller logs "PHASE TRANSITION: [-1] -> [0]" at run start.
+            let t0;
+            while (!t0 && Date.now() < deadline - 30_000) {
+                await new Promise((r) => setTimeout(r, 1000));
+                if (spawnError)
+                    return jsonResult(false, { tool: "weather_capture_phase_stills", error: `game launch failed: ${spawnError}` });
+                try {
+                    const log = await fsp.readFile(logPath, "utf8");
+                    if (/PHASE TRANSITION: \[-1\]/.test(log))
+                        t0 = Date.now();
+                }
+                catch {
+                    /* log not written yet */
+                }
+            }
+            if (!t0)
+                return jsonResult(false, { tool: "weather_capture_phase_stills", error: "run start never appeared in the log" });
+            for (const ph of meta.phases) {
+                const due = t0 + (ph.start * fixedTimerSeconds + 2) * 1000;
+                if (due > deadline - 10_000) {
+                    shots.push({ phase: ph.name, ok: false, detail: "skipped: would exceed timeout" });
+                    continue;
+                }
+                const wait = due - Date.now();
+                if (wait < -3000) {
+                    shots.push({ phase: ph.name, ok: false, detail: "missed: phase elapsed before capture was possible" });
+                    continue;
+                }
+                if (wait > 0)
+                    await new Promise((r) => setTimeout(r, wait));
+                const file = path.join(shotsDir, `phase-${ph.name.replace(/[^A-Za-z0-9_-]/g, "_")}-${Date.now()}.png`);
+                const cap = await runProcess("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "-OutFile", file, "-ConsoleCmds", "", "-GamePid", String(gamePid)], 45_000);
+                shots.push({
+                    phase: ph.name,
+                    file,
+                    ok: cap.stdout.includes("MCPSHOT SAVED") && existsSync(file),
+                    detail: cap.stdout.match(/MCPSHOT \w+[^\r\n]*/)?.[0],
+                });
+            }
+        }
+        finally {
+            killGame();
+        }
+        const captured = shots.filter((s) => s.ok).length;
+        return jsonResult(captured > 0, {
+            tool: "weather_capture_phase_stills",
+            profile,
+            fixedTimerSeconds,
+            captured,
+            total: meta.phases.length,
+            shots,
+        });
+    });
+    // Phase C: always restore, and surface a restore failure loudly.
+    const restore = await restoreDriver();
+    const restoreParsed = JSON.parse(restore.content[0].text);
+    const resultParsed = JSON.parse(result.content[0].text);
+    if (!restoreParsed.ok) {
+        return jsonResult(false, {
+            ...resultParsed,
+            ok: undefined,
+            error: `DRIVER NOT RESTORED to ${meta.orig_driver} — fix with unreal_set_asset_properties before shipping`,
+        });
+    }
+    return jsonResult(resultParsed.ok, { ...resultParsed, ok: undefined, driverRestored: meta.orig_driver });
+});
+// ── animation manager: asset-level audit ─────────────────────────
+server.tool("anim_audit_assets", "READ-ONLY animation audit for a skeleton: every AnimSequence (play length, rate scale, additive), " +
+    "BlendSpace (sample positions + which sequence at which speed), Montage, and AnimBlueprint under " +
+    "a search path, plus which assets the AnimBP actually references (orphan detection via the asset " +
+    "registry). The state-machine GRAPH itself is Blueprint territory — audit that via the live " +
+    "UnrealClaude plugin, not headless.", {
+    skeleton: gamePathSchema,
+    searchPath: gamePathSchema.default("/Game"),
+    allowWithEditorOpen: z.boolean().default(true),
+    timeoutSeconds: timeoutSchema,
+    dryRun: z.boolean().default(false),
+}, async ({ skeleton, searchPath, allowWithEditorOpen, timeoutSeconds, dryRun }) => {
+    try {
+        assertGamePath(skeleton, "skeleton");
+        assertGamePath(searchPath, "searchPath");
+    }
+    catch (e) {
+        return jsonResult(false, { tool: "anim_audit_assets", error: String(e) });
+    }
+    const body = `${PY_HEADER}
+reg = unreal.AssetRegistryHelpers.get_asset_registry()
+skel_path = ${pyString(skeleton)}
+skel = unreal.load_asset(skel_path)
+if not skel:
+    raise RuntimeError("skeleton missing: %s" % skel_path)
+f = unreal.ARFilter(package_paths=[${pyString(searchPath)}], recursive_paths=True)
+seqs, blends, montages, abps = [], [], [], []
+for ad in reg.get_assets(f):
+    cls = str(ad.asset_class_path.asset_name)
+    if cls not in ("AnimSequence", "BlendSpace", "BlendSpace1D", "AnimMontage", "AnimBlueprint"):
+        continue
+    obj = unreal.load_asset(str(ad.package_name))
+    if not obj:
+        continue
+    try:
+        obj_skel = obj.get_editor_property("target_skeleton") if cls == "AnimBlueprint" else obj.get_editor_property("skeleton")
+    except Exception:
+        obj_skel = None
+    if obj_skel != skel:
+        continue
+    p = str(ad.package_name)
+    if cls == "AnimSequence":
+        entry = {"path": p}
+        try:
+            entry["length"] = round(obj.get_play_length(), 3)
+        except Exception:
+            pass
+        try:
+            entry["rate_scale"] = float(obj.get_editor_property("rate_scale"))
+            entry["additive"] = str(obj.get_editor_property("additive_anim_type"))
+        except Exception:
+            pass
+        seqs.append(entry)
+    elif cls in ("BlendSpace", "BlendSpace1D"):
+        entry = {"path": p, "samples": []}
+        try:
+            for s in obj.get_editor_property("sample_data"):
+                anim = s.get_editor_property("animation")
+                val = s.get_editor_property("sample_value")
+                entry["samples"].append({"anim": anim.get_name() if anim else None,
+                                          "at": [round(val.x, 1), round(val.y, 1)]})
+        except Exception as e:
+            entry["samples"] = "<unreadable: %s>" % str(e)[:50]
+        blends.append(entry)
+    elif cls == "AnimMontage":
+        montages.append({"path": p})
+    elif cls == "AnimBlueprint":
+        deps = reg.get_dependencies(unreal.Name(p.rsplit("/", 1)[0] + "/" + p.rsplit("/", 1)[-1]),
+                                    unreal.AssetRegistryDependencyOptions()) or []
+        abps.append({"path": p, "refs": sorted(str(d) for d in deps if str(d).startswith("/Game/"))})
+abp_refs = set()
+for b in abps:
+    abp_refs.update(b["refs"])
+orphans = [s["path"] for s in seqs if s["path"] not in abp_refs]
+out = {"skeleton": skel_path, "sequences": seqs, "blendspaces": blends,
+       "montages": montages, "animBlueprints": abps, "sequencesNotReferencedByAnyABP": orphans}
+unreal.log("MCP ANIM_JSON " + json.dumps(out, default=str))
+unreal.log("MCP ANIM_COUNTS seq=%d blend=%d montage=%d abp=%d orphans=%d"
+           % (len(seqs), len(blends), len(montages), len(abps), len(orphans)))
+unreal.log("MCP OK anim_audit_assets")
+`;
+    return execGenerated("anim_audit_assets", body, { timeoutSeconds, dryRun, allowWithEditorOpen });
 });
 // ── startup ──────────────────────────────────────────────────────
 async function main() {

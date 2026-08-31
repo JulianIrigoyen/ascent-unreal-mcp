@@ -20,7 +20,10 @@ const fail = (msg) => {
 const tools = await client.listTools();
 const names = tools.tools.map((t) => t.name).sort();
 const expected = [
+    "anim_audit_assets",
+    "ascent_apply_then_verify",
     "ascent_unreal_status",
+    "weather_capture_phase_stills",
     "uds_apply_preset",
     "uds_inspect_level",
     "unreal_apply_material_to_actor",
