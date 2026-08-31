@@ -1,4 +1,4 @@
-# ascent-unreal-mcp v2
+# ascent-unreal-mcp v2.1
 
 Project-specific MCP server for operating Ascent's Unreal project through
 headless commandlets — small named tools, not arbitrary editor mutation.
@@ -22,6 +22,27 @@ every lesson that cost an hour is now a default.
 - `uds_apply_preset` — editor-time lookdev presets. **Runtime phase profiles
   (DA_TOD_*) override these every tick in-game** — look checks only.
 - `ascent_unreal_status` — paths, editor-running state, housekeeping.
+
+### v2.1 world-building suite
+
+- `unreal_list_assets` — asset-registry discovery (path + class/name filters).
+- `unreal_asset_probe` / `unreal_set_asset_properties` — read/write properties
+  on ANY asset (DataAssets, meshes, materials) or a Blueprint's class
+  defaults. Struct/array writes are out of scope — script those.
+- `unreal_spawn_actors` — batch placement (mesh/BP/class sources, transforms,
+  tags, `clearTag` idempotency). Headless has **no physics**: supply Z.
+- `unreal_import_assets` — batch FBX/texture/audio import; `textureType`
+  configures normal/mask compression. Chunk big texture batches.
+- `unreal_import_animation` — anim-only FBX onto an existing skeleton with
+  the Trekker pipeline settings.
+- `unreal_create_material_instance` — MI from parent + scalar/vector/texture
+  params, verified by **readback** (UE 5.7's MEL setters return false even
+  on success).
+- `unreal_snapshot_level` — regenerates `.claude/level-snapshot.md`.
+- `unreal_screenshot` — **the eyes**: launch `-game`, BugItGo vantages,
+  console commands, screen captures, PNG paths back. Targets the game
+  strictly by PID and never sends a keystroke unless the game verifiably
+  holds foreground focus.
 
 ## Behavior contract (what v2 guarantees)
 
