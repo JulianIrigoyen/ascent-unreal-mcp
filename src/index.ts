@@ -220,15 +220,25 @@ server.tool(
 
 server.tool(
   "uds_setup_mcp_weather_demo",
-  "Create and wire /Game/Maps/mcp_playground to the one-minute UDS weather choreography profile.",
+  "Create and wire /Game/Maps/mcp_playground to the one-minute UDS weather choreography profile, then verify it by default.",
   {
     timeoutSeconds: z.number().int().positive().default(300),
+    verify: z.boolean().default(true),
     dryRun: z.boolean().default(true),
   },
-  async ({ timeoutSeconds, dryRun }) => {
+  async ({ timeoutSeconds, verify, dryRun }) => {
     const scriptPath = resolveScript("scripts/setup_mcp_weather_demo.py");
     if (!existsSync(scriptPath)) throw new Error(`Script not found: ${scriptPath}`);
-    return toText(await runUnrealScript(scriptPath, dryRun, timeoutSeconds));
+    const setup = await runUnrealScript(scriptPath, dryRun, timeoutSeconds);
+    const result: Record<string, unknown> = { setup };
+    if (verify) {
+      const verifyPath = resolveScript("scripts/verify_mcp_weather_demo.py");
+      if (!existsSync(verifyPath)) throw new Error(`Verifier not found: ${verifyPath}`);
+      result.verify = dryRun
+        ? { command: editorCmd, args: [uproject, "-run=pythonscript", `-script=${verifyPath}`], dryRun }
+        : await runUnrealScript(verifyPath, false, timeoutSeconds);
+    }
+    return toText(result);
   },
 );
 
