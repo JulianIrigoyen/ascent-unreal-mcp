@@ -1,39 +1,72 @@
-# ascent-unreal-mcp
+# ascent-unreal-mcp v2
 
-Project-specific MCP server for operating Ascent's Unreal project in a more orderly way.
+Project-specific MCP server for operating Ascent's Unreal project through
+headless commandlets — small named tools, not arbitrary editor mutation.
 
-It intentionally exposes small, named tools instead of arbitrary editor mutation:
+v2 is a field-hardened rewrite after the 2026-08-31 aurora/blizzard night:
+every lesson that cost an hour is now a default.
 
-- `unreal_run_python_script`: run a Python script under the project `scripts/` folder.
-- `unreal_duplicate_map`: duplicate a map asset.
-- `unreal_apply_material_to_actor`: assign a material slot on a named actor in one map.
-- `unreal_apply_lanin_gaea_lab_material`: one-click apply for the current Lanin Gaea lab material.
-- `uds_inspect_level`: inspect Ultra Dynamic Sky actors and important weather/time fields.
-- `uds_apply_preset`: apply named UDS weather/time presets.
+## Tools
 
-Most mutation tools default to `dryRun: true`. Use the dry-run command output first, then rerun with `dryRun: false` when the target is correct.
+- `unreal_run_python_script` — run a repo `scripts/*.py` through a commandlet,
+  with `args` (reach the script via `sys.argv`) and an `outputFilter` regex.
+- `unreal_probe_actor` — **read-only**: load a map, read actor properties by
+  editor display name (`"Use Auroras"`, `"Ultra Dynamic Weather"`). The tool
+  shape that found both of tonight's dead wires.
+- `unreal_set_actor_properties` — set display-name properties on matching
+  actors and save (python literals via `pyValue`; booleans work).
+- `unreal_duplicate_map` — duplicate a `/Game/...` map asset.
+- `unreal_apply_material_to_actor` — assign a material slot on a named actor.
+- `uds_inspect_level` — read-only sky/weather report: aurora/space switches,
+  the sky→UDW reference, snow/rain state, manual-override pins.
+- `uds_apply_preset` — editor-time lookdev presets. **Runtime phase profiles
+  (DA_TOD_*) override these every tick in-game** — look checks only.
+- `ascent_unreal_status` — paths, editor-running state, housekeeping.
+
+## Behavior contract (what v2 guarantees)
+
+- **Commandlet flags**: `-stdout -Unattended -NoSplash -NoLogTimes
+  -SCCProvider=None` always. Without `-stdout`, `unreal.log` lines never
+  reach the caller; without `-Unattended`, one modal dialog eats the timeout.
+- **Exit codes are checked**: failures return `isError` with the log tail —
+  never a success-shaped blob.
+- **Output is filtered**: marker lines (default `MCP |LogPython`) + a short
+  tail on failure. Raw multi-MB UE logs never reach the model.
+- **Runs are serialized** behind a mutex; two commandlets never race the
+  project.
+- **Editor detection**: mutating tools refuse while `UnrealEditor.exe` runs
+  (commandlet saves lose to editor file locks, silently) unless
+  `allowWithEditorOpen: true`. Read-only tools allow it by default.
+- **Timeouts kill the whole process tree** (`taskkill /T /F`), not just the
+  root — no orphaned ShaderCompileWorkers.
+- **Saves** use `save_map` **plus** `save_dirty_packages(True, True)` —
+  World Partition OFPA actors don't flush on `save_map` alone.
+- **dryRun defaults to `true`** on mutating tools and returns the exact
+  command line; generated scripts are pruned (newest 100 kept).
 
 ## Setup
 
-From this folder:
-
 ```powershell
+cd tools/ascent-unreal-mcp
 npm install
-npm run build
+npm test    # build + unit tests (node:test) + stdio smoke test — no Unreal needed
 ```
 
-The repo `.mcp.json` registers this server as `ascent_unreal`.
+The repo `.mcp.json` registers this server as `ascent_unreal`. It launches
+`dist/index.js`, so rebuild after editing.
 
 ## Environment
 
-- `ASCENT_ROOT`: repository root. Defaults to the current working directory.
-- `ASCENT_UPROJECT`: Unreal project path. Defaults to `ASCENT_ROOT/Ascent/Ascent.uproject`.
-- `UNREAL_EDITOR_CMD`: Unreal commandlet executable. Defaults to UE 5.7.
+- `ASCENT_ROOT`: repository root (default: `cwd/../..`).
+- `ASCENT_UPROJECT`: project path (default: `ASCENT_ROOT/Ascent/Ascent.uproject`).
+- `UNREAL_EDITOR_CMD`: commandlet executable (default: UE 5.7 Program Files).
 
-## Design Rules
+## Design rules
 
-- Generated Python scripts are written to `scripts/generated/mcp`.
-- Asset paths must be `/Game/...`.
-- Local scripts must stay inside the repo `scripts/` folder.
-- Tool calls should prefer map-specific mutations over global edits.
-- UDS preset names are explicit; no unreviewed free-form weather mutations.
+- Generated python goes to `scripts/generated/mcp/`; local scripts must live
+  under `scripts/`; asset paths must be `/Game/...` with no traversal.
+- Prefer `unreal_probe_actor` before believing any push-side log: the aurora
+  was "pushed" for a week to a feature whose master switch was off.
+- Never drive in-editor map switches through the UnrealClaude script queue
+  (editor crash + boot re-run loop); map-switching batch work belongs here,
+  headless, with editors closed.
